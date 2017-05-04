@@ -186,3 +186,45 @@ type DNSConfig struct {
 
 Also, envconfig will use a `Set(string) error` method like from the
 [flag.Value](https://godoc.org/flag#Value) interface if implemented.
+
+## Custom Getters
+
+The Getter interface was added so that types that implement this can get 
+values from places other than environment variables. An example would be 
+to get values from consul, vault or some other store. The Getter will 
+need to be implemented on the struct and this will override the EnvVar
+Getter. Example of custom getting:
+
+```Go
+type PluginTestGetter struct {
+	EnvVarGetter
+
+	SpecialValues map[string]map[string]string
+}
+
+// The Getter provider
+func (g PluginTestGetter) Provider() string {
+	return "PluginTestGetter"
+}
+
+func (t *PluginTestGetter) Get(key, alt string, tags reflect.StructTag) (string, bool, error) {
+	special := tags.Get("special")
+	if special != "" {
+		var valueMap map[string]string
+		var value string
+		var exists bool
+		valueMap, exists = t.SpecialValues[key]
+		if exists {
+			value, exists = valueMap[special]
+			if exists {
+				return value, true, nil
+			}
+		}
+	}
+
+	return t.EnvVarGetter.Get(key, alt, tags)
+}
+```
+
+The example above will get values from a specified map if it a field
+has a particular map tag.
