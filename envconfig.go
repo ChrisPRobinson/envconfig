@@ -28,6 +28,44 @@ type ParseError struct {
 	Err       error
 }
 
+// GetterError occurs when an a field cannot be obtained
+// from a custom Getter.
+type GetterError struct {
+	KeyName   string
+	FieldName string
+	Provider  string
+	Err       error
+}
+
+// Getter is used to get a field value from the env or somewhere else
+type Getter interface {
+	Get(key, alt string, tags reflect.StructTag) (string, bool, error)
+	Provider() string
+}
+
+// EnvVarGetter will get the values using os.Lookup
+type EnvVarGetter struct {
+}
+
+// Provider returns the name of the get provider
+func (g EnvVarGetter) Provider() string {
+	return "EnvVarGetter"
+}
+
+// Get will return the value for the specified key or false if none can be found.
+func (g EnvVarGetter) Get(key, alt string, tags reflect.StructTag) (string, bool, error) {
+	// `os.Getenv` cannot differentiate between an explicitly set empty value
+	// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
+	// but it is only available in go1.5 or newer. We're using Go build tags
+	// here to use os.LookupEnv for >=go1.5
+	value, ok := lookupEnv(key)
+	if !ok && alt != "" {
+		value, ok = lookupEnv(alt)
+	}
+
+	return value, ok, nil
+}
+
 // Decoder has the same semantics as Setter, but takes higher precedence.
 // It is provided for historical compatibility.
 type Decoder interface {
@@ -42,6 +80,10 @@ type Setter interface {
 
 func (e *ParseError) Error() string {
 	return fmt.Sprintf("envconfig.Process: assigning %[1]s to %[2]s: converting '%[3]s' to type %[4]s. details: %[5]s", e.KeyName, e.FieldName, e.Value, e.TypeName, e.Err)
+}
+
+func (e *GetterError) Error() string {
+	return fmt.Sprintf("envconfig.Process: getting value %s from provider %s for field %s has failed: details: %s", e.KeyName, e.Provider, e.FieldName, e.Err)
 }
 
 // varInfo maintains information about the configuration variable
@@ -146,15 +188,21 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 func Process(prefix string, spec interface{}) error {
 	infos, err := gatherInfo(prefix, spec)
 
+	getter, hasGetter := spec.(Getter)
+	if !hasGetter {
+		getter = EnvVarGetter{}
+	}
+
 	for _, info := range infos {
 
-		// `os.Getenv` cannot differentiate between an explicitly set empty value
-		// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
-		// but it is only available in go1.5 or newer. We're using Go build tags
-		// here to use os.LookupEnv for >=go1.5
-		value, ok := lookupEnv(info.Key)
-		if !ok && info.Alt != "" {
-			value, ok = lookupEnv(info.Alt)
+		value, ok, err := getter.Get(info.Key, info.Alt, info.Tags)
+		if err != nil {
+			return &GetterError{
+				Provider:  getter.Provider(),
+				KeyName:   info.Key,
+				FieldName: info.Name,
+				Err:       err,
+			}
 		}
 
 		def := info.Tags.Get("default")
@@ -170,7 +218,7 @@ func Process(prefix string, spec interface{}) error {
 			continue
 		}
 
-		err := processField(value, info.Field)
+		err = processField(value, info.Field)
 		if err != nil {
 			return &ParseError{
 				KeyName:   info.Key,
