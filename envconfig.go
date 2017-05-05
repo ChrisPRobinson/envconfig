@@ -39,7 +39,7 @@ type GetterError struct {
 
 // Getter is used to get a field value from the env or somewhere else
 type Getter interface {
-	Get(key, alt string, tags reflect.StructTag) (string, bool, error)
+	Get(name, key, alt string, tags reflect.StructTag) (string, bool, error)
 	Provider() string
 }
 
@@ -53,7 +53,7 @@ func (g EnvVarGetter) Provider() string {
 }
 
 // Get will return the value for the specified key or false if none can be found.
-func (g EnvVarGetter) Get(key, alt string, tags reflect.StructTag) (string, bool, error) {
+func (g EnvVarGetter) Get(name, key, alt string, tags reflect.StructTag) (string, bool, error) {
 	// `os.Getenv` cannot differentiate between an explicitly set empty value
 	// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
 	// but it is only available in go1.5 or newer. We're using Go build tags
@@ -137,7 +137,6 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 			Tags:  ftype.Tag,
 			Alt:   strings.ToUpper(ftype.Tag.Get("envconfig")),
 		}
-
 		// Default to the field name as the env var name (will be upcased)
 		info.Key = info.Name
 
@@ -187,15 +186,13 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 // Process populates the specified struct based on environment variables
 func Process(prefix string, spec interface{}) error {
 	infos, err := gatherInfo(prefix, spec)
-
 	getter, hasGetter := spec.(Getter)
 	if !hasGetter {
 		getter = EnvVarGetter{}
 	}
 
 	for _, info := range infos {
-
-		value, ok, err := getter.Get(info.Key, info.Alt, info.Tags)
+		value, ok, err := getter.Get(info.Name, info.Key, info.Alt, info.Tags)
 		if err != nil {
 			return &GetterError{
 				Provider:  getter.Provider(),
