@@ -395,13 +395,16 @@ func TestAlternateNameDefaultVar(t *testing.T) {
 		t.Errorf("expected %q, got %q", "betterbroker", s.NoPrefixDefault)
 	}
 
+	// Difference is that new logic reviews actual values and it was set
+	// previously so it won't set a default.
+	var s2 Specification
 	os.Clearenv()
 	os.Setenv("ENV_CONFIG_REQUIREDVAR", "foo")
-	if err := Process("env_config", &s); err != nil {
+	if err := Process("env_config", &s2); err != nil {
 		t.Error(err.Error())
 	}
 
-	if s.NoPrefixDefault != "127.0.0.1" {
+	if s2.NoPrefixDefault != "127.0.0.1" {
 		t.Errorf("expected %q, got %q", "127.0.0.1", s.NoPrefixDefault)
 	}
 }
