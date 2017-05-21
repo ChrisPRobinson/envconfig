@@ -28,44 +28,6 @@ type ParseError struct {
 	Err       error
 }
 
-// GetterError occurs when an a field cannot be obtained
-// from a custom Getter.
-type GetterError struct {
-	KeyName   string
-	FieldName string
-	Provider  string
-	Err       error
-}
-
-// Getter is used to get a field value from the env or somewhere else
-type Getter interface {
-	Get(name, key, alt string, tags reflect.StructTag) (string, bool, error)
-	Provider() string
-}
-
-// EnvVarGetter will get the values using os.Lookup
-type EnvVarGetter struct {
-}
-
-// Provider returns the name of the get provider
-func (g EnvVarGetter) Provider() string {
-	return "EnvVarGetter"
-}
-
-// Get will return the value for the specified key or false if none can be found.
-func (g EnvVarGetter) Get(name, key, alt string, tags reflect.StructTag) (string, bool, error) {
-	// `os.Getenv` cannot differentiate between an explicitly set empty value
-	// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
-	// but it is only available in go1.5 or newer. We're using Go build tags
-	// here to use os.LookupEnv for >=go1.5
-	value, ok := lookupEnv(key)
-	if !ok && alt != "" {
-		value, ok = lookupEnv(alt)
-	}
-
-	return value, ok, nil
-}
-
 // Decoder has the same semantics as Setter, but takes higher precedence.
 // It is provided for historical compatibility.
 type Decoder interface {
@@ -82,10 +44,6 @@ func (e *ParseError) Error() string {
 	return fmt.Sprintf("envconfig.Process: assigning %[1]s to %[2]s: converting '%[3]s' to type %[4]s. details: %[5]s", e.KeyName, e.FieldName, e.Value, e.TypeName, e.Err)
 }
 
-func (e *GetterError) Error() string {
-	return fmt.Sprintf("envconfig.Process: getting value %s from provider %s for field %s has failed: details: %s", e.KeyName, e.Provider, e.FieldName, e.Err)
-}
-
 // varInfo maintains information about the configuration variable
 type varInfo struct {
 	Name  string
@@ -93,10 +51,13 @@ type varInfo struct {
 	Key   string
 	Field reflect.Value
 	Tags  reflect.StructTag
+
+	// User Set
+	ValueSet bool
 }
 
 // GatherInfo gathers information about the specified struct
-func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
+func gatherInfo(prefix string, spec interface{}) ([]*varInfo, error) {
 	expr := regexp.MustCompile("([^A-Z]+|[A-Z][^A-Z]+|[A-Z]+)")
 	s := reflect.ValueOf(spec)
 
@@ -110,7 +71,7 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 	typeOfSpec := s.Type()
 
 	// over allocate an info array, we will extend if needed later
-	infos := make([]varInfo, 0, s.NumField())
+	infos := make([]*varInfo, 0, s.NumField())
 	for i := 0; i < s.NumField(); i++ {
 		f := s.Field(i)
 		ftype := typeOfSpec.Field(i)
@@ -159,7 +120,7 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 			info.Key = fmt.Sprintf("%s_%s", prefix, info.Key)
 		}
 		info.Key = strings.ToUpper(info.Key)
-		infos = append(infos, info)
+		infos = append(infos, &info)
 
 		if f.Kind() == reflect.Struct {
 			// honor Decode if present
@@ -183,39 +144,24 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 	return infos, nil
 }
 
-// Process populates the specified struct based on environment variables
-func Process(prefix string, spec interface{}) error {
-	infos, err := gatherInfo(prefix, spec)
-	getter, hasGetter := spec.(Getter)
-	if !hasGetter {
-		getter = EnvVarGetter{}
-	}
+type HandleConfig func([]*varInfo, string, interface{}) error
 
+func EnvVarValueApplier(infos []*varInfo, prefix string, spec interface{}) error {
 	for _, info := range infos {
-		value, ok, err := getter.Get(info.Name, info.Key, info.Alt, info.Tags)
-		if err != nil {
-			return &GetterError{
-				Provider:  getter.Provider(),
-				KeyName:   info.Key,
-				FieldName: info.Name,
-				Err:       err,
-			}
+		// `os.Getenv` cannot differentiate between an explicitly set empty value
+		// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
+		// but it is only available in go1.5 or newer. We're using Go build tags
+		// here to use os.LookupEnv for >=go1.5
+		value, ok := lookupEnv(info.Key)
+		if !ok && info.Alt != "" {
+			value, ok = lookupEnv(info.Alt)
 		}
 
-		def := info.Tags.Get("default")
-		if def != "" && !ok {
-			value = def
-		}
-
-		req := info.Tags.Get("required")
-		if !ok && def == "" {
-			if isTrue(req) {
-				return fmt.Errorf("required key %s missing value", info.Key)
-			}
+		if !ok {
 			continue
 		}
 
-		err = processField(value, info.Field)
+		err := processField(value, info.Field)
 		if err != nil {
 			return &ParseError{
 				KeyName:   info.Key,
@@ -225,9 +171,98 @@ func Process(prefix string, spec interface{}) error {
 				Err:       err,
 			}
 		}
+		info.ValueSet = true
 	}
 
-	return err
+	return nil
+}
+
+func DefaultValueApplier(infos []*varInfo, prefix string, spec interface{}) error {
+	for _, info := range infos {
+		def := info.Tags.Get("default")
+		if def != "" {
+			hasValueSet := hasValue(info.Field)
+			if !hasValueSet {
+				err := processField(def, info.Field)
+				if err != nil {
+					return &ParseError{
+						KeyName:   info.Key,
+						FieldName: info.Name,
+						TypeName:  info.Field.Type().String(),
+						Value:     def,
+						Err:       err,
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func RequiredValueChecker(infos []*varInfo, prefix string, spec interface{}) error {
+	for _, info := range infos {
+		req := info.Tags.Get("required")
+		if req != "" {
+			hasValueSet := hasValue(info.Field)
+			if !hasValueSet && !info.ValueSet {
+				return fmt.Errorf("required key %s missing value", info.Key)
+			}
+		}
+	}
+
+	return nil
+}
+
+func hasValue(field reflect.Value) bool {
+	typ := field.Type()
+
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+		if field.IsNil() {
+			field.Set(reflect.New(typ))
+		}
+		field = field.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.String:
+		return len(field.String()) != 0
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return field.Int() != 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return field.Uint() != 0
+	case reflect.Bool:
+		return field.Bool() == true
+	case reflect.Float32, reflect.Float64:
+		return field.Float() != 0
+	case reflect.Slice:
+		return field.Len() > 0
+	case reflect.Map:
+		return field.Len() > 0
+	}
+	return false
+}
+
+var handleConfigFuncs = []HandleConfig{
+	DefaultValueApplier,
+	EnvVarValueApplier,
+	RequiredValueChecker,
+}
+
+// Process populates the specified struct based on environment variables
+func Process(prefix string, spec interface{}) error {
+	infos, err := gatherInfo(prefix, spec)
+	if err != nil {
+		return err
+	}
+
+	for _, handler := range handleConfigFuncs {
+		err = handler(infos, prefix, spec)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // MustProcess is the same as Process but panics if an error occurs
